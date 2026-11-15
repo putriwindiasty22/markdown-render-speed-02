@@ -16,6 +16,12 @@
 // splitCells splits on unescaped pipes in a single pass; both keep marked's
 // exact behaviour. expandTabs now indexes code units instead of iterating
 // code points (its inputs are whitespace only, so this is identical).
+//
+// Revised again in this session (round 2): escapeHtmlEntities now does a
+// single String.replace instead of a .test() pre-scan followed by the
+// replace — replace returns the input unchanged when nothing matches, so
+// the pre-scan only doubled the work on every escaped string. The two
+// test-only regexes (escapeTest, escapeTestNoEncode) are removed with it.
 
 // ---------- regex builders ----------
 function edit(regex, opt = '') {
@@ -90,9 +96,7 @@ const other = {
   unicodeAlphaNumeric: /[\p{L}\p{N}]/u,
   numericCharacterReference: /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));/,
   numericCharacterReferenceOrAmpersand: /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g,
-  escapeTest: /[&<>"']/,
   escapeReplace: /[&<>"']/g,
-  escapeTestNoEncode: /[<>"']|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/,
   escapeReplaceNoEncode: /[<>"']|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g,
   caret: /(^|[^\[])\^/g,
   percentDecode: /%25/g,
@@ -423,14 +427,13 @@ const escapeReplacements = {
 const getEscapeReplacement = (ch) => escapeReplacements[ch];
 
 function escapeHtmlEntities(html, encode) {
+  // A single replace does the whole job: when nothing matches it returns
+  // the input unchanged, so the old .test() pre-scan only doubled the
+  // work on every escaped string (two scans instead of one).
   if (encode) {
-    if (other.escapeTest.test(html)) {
-      return html.replace(other.escapeReplace, getEscapeReplacement);
-    }
-  } else if (other.escapeTestNoEncode.test(html)) {
-    return html.replace(other.escapeReplaceNoEncode, getEscapeReplacement);
+    return html.replace(other.escapeReplace, getEscapeReplacement);
   }
-  return html;
+  return html.replace(other.escapeReplaceNoEncode, getEscapeReplacement);
 }
 
 function decodeNumericCharacterReferences(text) {
@@ -891,9 +894,13 @@ function tokList(ctx, src) {
       if (!(cap = itemRegex.exec(src))) {
         break;
       }
-      if (blockStartChar(src) === '-' || blockStartChar(src) === '_' || blockStartChar(src) === '*') {
-        if (block.hr.test(src)) {
-          break;
+      {
+        // blockStartChar is pure in src: compute it once instead of three times.
+        const firstChar = blockStartChar(src);
+        if (firstChar === '-' || firstChar === '_' || firstChar === '*') {
+          if (block.hr.test(src)) {
+            break;
+          }
         }
       }
       const itemStart = taken();

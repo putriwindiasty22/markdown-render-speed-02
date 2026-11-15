@@ -6,7 +6,7 @@
 // container, MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in for /input
 // and /output.
 
-import { readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from './parse.js';
 
@@ -20,6 +20,9 @@ function main(): void {
   for (let i = 0; i < cases.length; i++) {
     html[i] = parse(cases[i].markdown);
   }
+  // The harness provides /output, but creating it when missing costs
+  // nothing and keeps local runs (e.g. a fresh MAKEFUN_OUTPUT_DIR) working.
+  mkdirSync(outputDir, { recursive: true });
   writeFileSync(join(outputDir, 'html.json'), JSON.stringify(html));
 }
 
