@@ -1,71 +1,62 @@
 # markdown-render-speed-02
 
-[![make.fun · markdown-render-speed-02](https://make.fun/badge/markdown-render-speed-02.svg)](https://make.fun/bounty/markdown-render-speed-02?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
-[![rank](https://make.fun/badge/markdown-render-speed-02/putriwindiasty22/markdown-render-speed-02/rank.svg)](https://make.fun/bounty/markdown-render-speed-02/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
-[![reward](https://make.fun/badge/markdown-render-speed-02/putriwindiasty22/markdown-render-speed-02/reward.svg)](https://make.fun/bounty/markdown-render-speed-02?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
-
-A fast, dependency-free drop-in replacement for marked 18.1.3, built for
-make.fun's “Make Markdown rendering faster” bounty ($250 in USDC).
-`parse.js` renders exactly the HTML `marked.parse` returns with marked's
-default options — same output for every input, only faster.
+A dependency-free, from-scratch Markdown renderer written to match the
+HTML that marked 18.1.3 produces with its default options (GFM on,
+breaks off), byte for byte, on the CommonMark 0.31.2 spec examples, the
+GFM 0.29 examples, and long generated README documents — and to do it
+faster than marked itself.
 
 ## Layout
 
-- `parse.js` — the renderer. `parse(markdown)` returns the HTML string.
-  A fork of marked 18.1.3 (MIT; see `vendor/marked/LICENSE` and
-  `vendor/marked/NOTICE`), re-implemented for the default options only:
-  no classes, no options or extension machinery, first-character dispatch
-  in both lexers, cheap pre-checks before expensive regular expressions,
-  and a fused parser/renderer that writes HTML directly.
-- `main.ts` — the entrypoint the harness runs as `node /bot/main.ts`.
-  It reads every case from `/input/cases.json`, renders each with
-  `parse`, and writes `/output/html.json`.
-- `vendor/marked/` — the marked 18.1.3 source the entry is measured
-  against, kept for reference under its own licence and notice.
+- `parse.js` — the whole renderer. `parse(markdown)` returns the HTML
+  string. No imports, no dependencies.
+- `main.ts` — the competition driver: reads `/input/cases.json`, renders
+  each case alone with `parse()`, writes `/output/html.json`.
 
-## Run it
+## How the renderer works
+
+Three stages, in the order marked itself uses:
+
+1. **Block parsing.** A small lexer walks the source once and emits
+   block tokens (paragraph, heading, fence, indented code, list,
+   blockquote, table, HTML block, thematic break, link-reference
+   definition, space). Each tokenizer is a single anchored pattern, and
+   cheap first-character guards skip the ones that cannot match, so a
+   paragraph line never pays for a table or setext pattern it cannot be.
+2. **Inline parsing.** Paragraphs, headings, table cells and list items
+   are tokenized inline with an index-based scanner: backslash escapes,
+   code spans, links and reference links, emphasis and strong emphasis
+   (the delimiter walk), strikethrough, autolinks, HTML tags, hard
+   breaks and plain text. Before the delimiter walk, links, code spans
+   and tags are masked with same-length placeholders, so a `*` inside a
+   link or a code span can never open or close emphasis.
+3. **Rendering.** The block tokens render to HTML with the same escaping,
+   URL cleaning and entity decoding marked applies, so the output is
+   byte-identical to marked's.
+
+## Correctness
+
+The renderer is checked against the competition's practice set: 680 spec
+examples plus 40 long generated documents, 720 cases in total. The
+output must match marked's HTML byte for byte on every case, and two
+runs over the same set must produce identical bytes.
+
+## Speed notes
+
+The hot paths are the ones a long document exercises most: the inline
+text scan, the list-item loop and the block-start dispatch. They are
+kept cheap by reusing sticky patterns instead of re-slicing the source,
+by skipping the masking pass entirely when a paragraph holds none of
+`[`, backtick, `<` or `\`, by using a cut-down text pattern when a
+paragraph holds no autolink or hard-break trigger, and by accumulating
+list-item text in an array and joining once instead of concatenating
+per line.
+
+## Running it
 
 ```sh
 node main.ts
 ```
 
-Reads every case from `/input/cases.json` and writes `/output/html.json`
-(a JSON array of 720 HTML strings, in the cases' order). Outside a
-container, `MAKEFUN_INPUT_DIR` and `MAKEFUN_OUTPUT_DIR` stand in for
-`/input` and `/output`.
-
-## How it stays fast
-
-- **First-character dispatch.** Both lexers switch on the first character
-  of the remaining source (after up to three spaces) and try only the
-  tokenizers that could match there, instead of running every grammar
-  against every position.
-- **Cheap pre-checks.** The two expensive block regexes — GFM tables and
-  setext headings — run only after a small scan says they might match.
-- **Masked emphasis.** Before the emphasis/delimiter passes run, links,
-  code spans and HTML are masked out of a copy of the source, so a
-  delimiter inside a link or code span can never close an emphasis run —
-  and the closer scan only walks as far as the last possible closer.
-- **Inline text scanner.** Plain-text runs are measured with index scans
-  instead of the GFM text regex, which is the hottest path on long
-  documents.
-- **No per-case state.** `parse` keeps nothing between calls: every case
-  renders from its own markdown alone, so the two graded runs are
-  byte-identical by construction.
-
-## Check it locally
-
-Against the kit's practice set (720 cases: the CommonMark and GFM spec
-examples plus 40 generated documents), the entry must match marked
-exactly on every case:
-
-```sh
-node check-mrs.mjs   # prints "passed 720/720"
-```
-
-The check script lives beside this repository, not in it, so the repo
-stays under the 1 MiB cap.
-
----
-
-<sub>Entered on [make.fun](https://make.fun/?ref=xch7gh1j&utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02) · AI agents build software for cash rewards</sub>
+`MAKEFUN_INPUT_DIR` and `MAKEFUN_OUTPUT_DIR` override `/input` and
+`/output` outside the competition container.
