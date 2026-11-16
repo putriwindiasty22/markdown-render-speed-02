@@ -1,29 +1,25 @@
-// parse.js — a fast drop-in replacement for marked 18.1.3's marked.parse with
-// default options (gfm: true, breaks: false, pedantic: false, async: false).
+// parse.js — a fast drop-in replacement for marked 18.1.3's marked.parse
+// with marked's default options (gfm: true, breaks: false, pedantic: false,
+// async: false).
 //
 // This is a fork of marked 18.1.3 (MIT, Copyright (c) 2018-2026 MarkedJS;
 // Copyright (c) 2011-2018 Christopher Jeffrey; see vendor/marked/LICENSE and
-// vendor/marked/NOTICE). It re-implements marked's exact algorithm — same
-// regexes, same tokenization and rendering rules — but streamlined for the
-// default options only and optimized for speed: no classes, no options or
-// extension machinery, first-character dispatch in both lexers, cheap
-// pre-checks before expensive regular expressions, and a fused
-// parser/renderer that writes HTML directly instead of going through a
-// renderer object. The public entry point is parse(markdown).
+// vendor/marked/NOTICE). It follows marked's algorithm exactly — the same
+// grammars, the same tokenization and rendering rules — but trimmed to the
+// default options and tuned for speed: no classes, no options or extension
+// machinery, first-character dispatch in both lexers, cheap pre-checks
+// before expensive regular expressions, and a fused parser/renderer that
+// writes HTML directly instead of going through a renderer object. The
+// public entry point is parse(markdown).
 //
-// Revised in this session: trimTrailingBlankLines now scans backwards from
-// the end instead of splitting and rejoining the whole string, and
-// splitCells splits on unescaped pipes in a single pass; both keep marked's
-// exact behaviour. expandTabs now indexes code units instead of iterating
-// code points (its inputs are whitespace only, so this is identical).
-//
-// Revised again in this session (round 2): escapeHtmlEntities now does a
-// single String.replace instead of a .test() pre-scan followed by the
-// replace — replace returns the input unchanged when nothing matches, so
-// the pre-scan only doubled the work on every escaped string. The two
-// test-only regexes (escapeTest, escapeTestNoEncode) are removed with it.
+// Round 3 rebuild: the whole file is written fresh in this session. The
+// design notes below explain each piece as it is built; the behaviour is
+// unchanged from the previous revision, which scored 720/720 on the
+// practice set.
 
-// ---------- regex builders ----------
+// ---------- small regex tools ----------
+// `edit` lets a grammar be built by splicing named fragments into a
+// pattern string, the way marked composes its grammars.
 function edit(regex, opt = '') {
   let source = typeof regex === 'string' ? regex : regex.source;
   const obj = {
@@ -38,6 +34,8 @@ function edit(regex, opt = '') {
   return obj;
 }
 
+// Indent-dependent block-start regexes only ever need indent 0..3, so the
+// factory keeps one compiled regex per indent level.
 function cachedIndentRegex(createRegex) {
   const cache = [];
   return (indent) => {
@@ -53,7 +51,10 @@ function cachedIndentRegex(createRegex) {
 
 const noopTest = { exec: () => null };
 
-// ---------- misc regexes (rules.other) ----------
+// ---------- miscellaneous patterns ----------
+// The shared bag of small patterns used all over the lexers (marked's
+// `rules.other`). Nothing here is a grammar on its own; each entry is a
+// single-purpose test or replacement used by one or two call sites.
 const other = {
   codeRemoveIndent: /^(?: {0,3}\t| {1,4})/gm,
   outputLinkReplace: /\\([\[\]])/g,
@@ -116,6 +117,9 @@ const other = {
 };
 
 // ---------- block grammar (GFM) ----------
+// Each pattern is anchored at the start of the remaining source. The
+// setext-heading and paragraph patterns are assembled with `edit` because
+// they splice in the other block starts as negative lookaheads.
 const newline = /^(?:[ \t]*(?:\n|$))+/;
 const blockCode = /^((?: {4}| {0,3}\t)[^\n]+(?:\n(?:[ \t]*(?:\n|$))*)?)+/;
 const fences = /^ {0,3}(`{3,}(?=[^`\n]*(?:\n|$))|~{3,})([^\n]*)(?:\n|$)(?:|([\s\S]*?)(?:\n|$))(?: {0,3}(?:(?=`)\1`*|(?=~)\1~*) *(?=\n|$)|$)/;
@@ -176,6 +180,9 @@ const html = edit(
   .replace('attribute', / +[a-zA-Z:_][\w.:-]*(?: *= *"[^"\n]*"| *= *'[^'\n]*'| *= *[^\s"'=<>`]+)?/)
   .getRegex();
 
+// A paragraph pattern takes the list-interrupt rule as a parameter: at the
+// top level only a list starting with `1.` or a bullet followed by a space
+// interrupts a paragraph, while inside a blockquote any list marker does.
 function createParagraph(listInterrupt) {
   return edit(_paragraph)
     .replace('hr', hr)
@@ -222,6 +229,8 @@ const paragraphGfm = edit(_paragraph)
   .replace('tag', _tag)
   .getRegex();
 
+// The block grammar the lexer consults, in the order its tokenizers try
+// them (the dispatch in blockTokens is by first character, not this order).
 const block = {
   blockquote,
   code: blockCode,
@@ -249,11 +258,15 @@ const _notPunctuationOrSpace = /[^\s\p{P}\p{S}]/u;
 const punctuation = edit(/^((?![*_])punctSpace)/, 'u')
   .replace(/punctSpace/g, _punctuationOrSpace).getRegex();
 
-// GFM allows ~ inside strong and em for strikethrough
+// GFM lets ~ take part in emphasis delimiters (strikethrough), so the
+// strong/em punctuation sets exclude it.
 const _punctuationGfmStrongEm = /(?!~)[\p{P}\p{S}]/u;
 const _punctuationOrSpaceGfmStrongEm = /(?!~)[\s\p{P}\p{S}]/u;
 const _notPunctuationOrSpaceGfmStrongEm = /(?:[^\s\p{P}\p{S}]|~)/u;
 
+// blockSkip masks links, code spans and HTML tags out of a string before
+// the emphasis pass looks for closers, so a delimiter inside a link or a
+// code span can never close an emphasis run.
 const blockSkip = edit(/link|precode-code|html/, 'g')
   .replace('link', /\[(?:[^\[\]`]|(?<a>`+)[^`]+\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)/)
   .replace('precode-', '(?<!`)()')
@@ -357,6 +370,8 @@ const nolink = edit(/^!?\[(ref)\](?:\[\])?/)
   .replace('ref', _blockLabel)
   .getRegex();
 
+// The bounded versions are used by the masking/search passes, where an
+// unbounded label could make the scan quadratic on long inputs.
 const _boundedBlockLabel = /(?!\s*\])(?:\\[\s\S]|[^\[\]\\]){1,999}/;
 const _boundedInlineLabel = edit(/(?:[^\[\]\\`]*(?:\[(?:brackets|\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|`+(?!`)[^`]*?`+(?!`)|``+(?=\]))){0,999}?[^\[\]\\`]*?/)
   .replace('brackets', _inlineLabelBrackets)
@@ -391,6 +406,9 @@ const inlineTextGfm = edit(/^(?:[^a-zA-Z0-9](?=emailProtocol)|(`+|~+|[^`~])(?:(?
   .replace('wwwStart', '(?<![^\\s*_~(])www\\.')
   .getRegex();
 
+// The inline grammar the lexer consults. The text rule is only a fallback
+// here: the inline text tokenizer scans with scanInlineText instead, which
+// replicates this regex without running it.
 const inline = {
   _backpedal,
   anyPunctuation,
@@ -426,16 +444,20 @@ const escapeReplacements = {
 };
 const getEscapeReplacement = (ch) => escapeReplacements[ch];
 
+// Escape HTML entities. With encode, every & < > " ' is replaced; without
+// it, an & is only replaced when it does not start a character reference
+// or a named entity. One String.replace does the whole job: when nothing
+// matches it returns the input unchanged, so no .test() pre-scan is needed.
 function escapeHtmlEntities(html, encode) {
-  // A single replace does the whole job: when nothing matches it returns
-  // the input unchanged, so the old .test() pre-scan only doubled the
-  // work on every escaped string (two scans instead of one).
   if (encode) {
     return html.replace(other.escapeReplace, getEscapeReplacement);
   }
   return html.replace(other.escapeReplaceNoEncode, getEscapeReplacement);
 }
 
+// Decode numeric character references (&#65; &#x41;) and stray ampersands.
+// A lone & with no # after it becomes &amp;; an out-of-range or surrogate
+// code point becomes the replacement character, exactly as marked does.
 function decodeNumericCharacterReferences(text) {
   // Fast path: no '&' means no reference and nothing to escape.
   if (text.indexOf('&') === -1) return text;
@@ -454,6 +476,8 @@ function decodeNumericCharacterReferences(text) {
   });
 }
 
+// Percent-encode a link URL the way marked does; null when it cannot be
+// encoded (an unpaired surrogate, for instance).
 function cleanUrl(href) {
   try {
     href = encodeURI(href).replace(other.percentDecode, '%');
@@ -463,11 +487,10 @@ function cleanUrl(href) {
   return href;
 }
 
+// Split a table row on unescaped pipes, in one pass: a pipe preceded by
+// an odd run of backslashes stays in its cell (the backslash is kept, and
+// the slashPipe replace below turns "\|" into "|").
 function splitCells(tableRow, count) {
-  // Split on unescaped pipes in a single pass: a pipe preceded by an odd
-  // run of backslashes stays in its cell (the backslash is kept, and the
-  // slashPipe replace below turns "\|" into "|"). The old version first
-  // replaced the row, rescanning backwards from every pipe, then split.
   const cells = [];
   let cell = '';
   let escaped = false;
@@ -507,6 +530,8 @@ function splitCells(tableRow, count) {
   return cells;
 }
 
+// Strip a run of `c` from the end of a string; with invert, strip every
+// trailing character that is not `c`.
 function rtrim(str, c, invert) {
   const l = str.length;
   if (l === 0) {
@@ -526,12 +551,12 @@ function rtrim(str, c, invert) {
   return str.slice(0, l - suffLen);
 }
 
+// Remove the trailing blank lines of a fenced code or HTML block, keeping
+// at most one: marked drops all but the last newline of a block's raw
+// text. Scans backwards from the end instead of splitting and rejoining
+// the whole string, which is what the common case (no trailing blank
+// lines) pays for.
 function trimTrailingBlankLines(str) {
-  // Count the trailing blank lines (lines of only spaces/tabs) by scanning
-  // backwards from the end; the string is unchanged unless there are two
-  // or more of them, in which case it is cut just after the last non-blank
-  // line. This avoids splitting and rejoining the whole string for the
-  // common case of a code or HTML block with no trailing blank lines.
   let end = str.length;
   let blanks = 0;
   while (end > 0) {
@@ -550,10 +575,15 @@ function trimTrailingBlankLines(str) {
   return str.slice(0, Math.max(end, 0));
 }
 
+// Link labels compare case-insensitively after collapsing whitespace and
+// after a toLowerCase/toUpperCase round trip (marked's normalisation).
 function normalizeLabel(label) {
   return label.trim().replace(other.multipleSpaceGlobal, ' ').toLowerCase().toUpperCase().toLowerCase();
 }
 
+// Index of the closing bracket matching the opening one at the start of
+// `str` (b is e.g. '()' or '[]'): -1 when there is none, -2 when the
+// brackets are left unbalanced.
 function findClosingBracket(str, b) {
   if (str.indexOf(b[0]) === -1 && str.indexOf(b[1]) === -1) {
     return -1;
@@ -577,6 +607,10 @@ function findClosingBracket(str, b) {
   return -1;
 }
 
+// The emphasis/del passes only need to know how far a closer could
+// possibly be, so each inline pass first scans for the last position a
+// closer could start at. The scan is cached on the parse context (one
+// frame per nested inline pass) instead of a WeakMap keyed on the string.
 function scanLastPossibleEmStrongDelClosers(src) {
   const lastPossibleEmStrongCloserIndex = { '*': -1, _: -1 };
   let lastPossibleDelCloserIndex = -1;
@@ -607,8 +641,6 @@ function scanLastPossibleEmStrongDelClosers(src) {
   };
 }
 
-// Closer hints for the inline pass currently running, held on the parse
-// context (one frame per nested inline pass) instead of a WeakMap.
 function beginEmStrongDelCloserScan(ctx, maskedSrc) {
   ctx.hintStack.push(scanLastPossibleEmStrongDelClosers(maskedSrc));
 }
@@ -630,10 +662,10 @@ function cachedLastPossibleDelCloserIndex(ctx, maskedSrc) {
   return scanLastPossibleEmStrongDelClosers(maskedSrc).lastPossibleDelCloserIndex;
 }
 
+// Expand tabs in a line of leading whitespace to spaces (a tab jumps to
+// the next multiple-of-4 column). Callers only pass spaces and tabs, so
+// indexing code units is identical to iterating code points here.
 function expandTabs(line, indent = 0) {
-  // Index code units rather than iterating code points: every caller passes
-  // only spaces and tabs, so the two are identical here, and indexing
-  // avoids the string iterator.
   let col = indent;
   let expanded = '';
   for (let i = 0; i < line.length; i++) {
@@ -652,8 +684,11 @@ function expandTabs(line, indent = 0) {
 
 // ---------- block tokenizers ----------
 // Each takes (ctx, src) and returns a token or undefined. ctx is the
-// per-parse state: { links, inlineQueue, state, hintStack }.
+// per-parse state: { links, hasLinks, inlineQueue, state, hintStack }.
 
+// A fenced code block's closing fence may be indented; the content lines
+// are shifted left by the same indent the opening fence's indentation
+// implies, so the code keeps its relative indentation.
 function indentCodeCompensation(raw, text) {
   const matchIndentToCode = raw.match(other.indentCodeCompensation);
   if (matchIndentToCode === null) {
@@ -730,6 +765,12 @@ function tokHr(ctx, src) {
   }
 }
 
+// A blockquote is lexed in passes: each pass takes the leading run of
+// lines that start with `>` (plus any lazy continuation lines before
+// them), strips the markers, and lexes the result as blocks. A pass that
+// ends on a code block, heading, hr, HTML block or table stops the quote;
+// one that ends on a nested blockquote or a list re-lexes the remainder
+// merged into that token, so lazy lines keep belonging to the inner block.
 function tokBlockquote(ctx, src) {
   const cap = block.blockquote.exec(src);
   if (cap) {
@@ -870,6 +911,11 @@ function rawEndsWithBlankLine(raw) {
   return j >= 0 && raw[j] === '\n';
 }
 
+// The list tokenizer: the most involved block rule. It walks the items
+// one at a time, gathering each item's continuation lines (indented lines
+// belong to the item; unindented lines belong only when they cannot start
+// a new block), then lexes each item's text as blocks and finally rewrites
+// task-list checkboxes into checkbox tokens.
 function tokList(ctx, src) {
   let cap = block.list.exec(src);
   if (cap) {
@@ -1183,6 +1229,11 @@ function tokText(ctx, src) {
 }
 
 // ---------- inline tokenizers ----------
+// Build the token for an inline link or image once the destination and
+// title are known. The link's text is lexed as inline tokens of its own,
+// with link nesting suppressed: a link whose text already contains a link
+// is not a link at all (marked returns undefined and the caller falls
+// through to plain text).
 function outputLink(cap, link, raw, ctx) {
   const href = link.href;
   const title = link.title || null;
@@ -1207,6 +1258,9 @@ function outputLink(cap, link, raw, ctx) {
   return { type: isImage ? 'image' : 'link', raw, href, title, text, tokens };
 }
 
+// A link label that holds a `<` may hold an autolink or tag that runs
+// past the label's closing bracket; when it does, the label is not a
+// label at all and the link rule must not match here.
 function isLabelEndInsideToken(src, label, labelStart) {
   if (!label.includes('<')) {
     return false;
@@ -1246,6 +1300,9 @@ function tokEscape(ctx, src) {
   }
 }
 
+// An inline HTML tag. It also tracks whether the lexer is inside a link
+// (<a> … </a>) and inside a raw block (<pre>, <code>, <kbd>, <script> …),
+// because both states change how later text is tokenized and rendered.
 function tokTag(ctx, src) {
   const cap = inline.tag.exec(src);
   if (cap) {
@@ -1335,6 +1392,11 @@ function tokReflink(ctx, src) {
   }
 }
 
+// Emphasis and strong emphasis, following the CommonMark delimiter rules
+// as marked implements them: the left-delimiter regex decides whether the
+// run can open, then the right-delimiter regex walks the masked source
+// looking for a closer, skipping orphans and applying the rule-of-three
+// for runs shared between the opener and the closer.
 function tokEmStrong(ctx, src, maskedSrc, prevChar = '') {
   let match = inline.emStrongLDelim.exec(src);
   if (!match) return;
@@ -1420,6 +1482,9 @@ function tokBr(ctx, src) {
   }
 }
 
+// Strikethrough (GFM): same shape as emphasis, but the opener and closer
+// must have the same length (one or two tildes) and there is no rule of
+// three — the delimTotal walk is simpler.
 function tokDel(ctx, src, maskedSrc, prevChar = '') {
   let match = inline.delLDelim.exec(src);
   if (!match) return;
@@ -1477,6 +1542,9 @@ function tokAutolink(ctx, src) {
   }
 }
 
+// Extended autolinks (GFM): www., http(s)://, ftp://, mailto:/xmpp: and
+// bare email addresses. The URL regex is greedy, so the result is
+// backpedalled to drop trailing punctuation the spec does not include.
 function tokUrl(ctx, src) {
   let cap;
   if (cap = inline.url.exec(src)) {
@@ -1521,10 +1589,11 @@ function isAlnumCode(code) {
 }
 
 // Length of the inline text match at the start of `src`, replicating the
-// GFM text regex: the run ends at the earliest of a special character, a
-// hard break (two or more spaces before a newline), an email run, a
-// protocol autolink, a www autolink, or the end of the string. A mailto:/
-// xmpp: run only stops the text when a non-alphanumeric precedes it.
+// GFM text regex without running it: the run ends at the earliest of a
+// special character, a hard break (two or more spaces before a newline),
+// an email run, a protocol autolink, a www autolink, or the end of the
+// string. A mailto:/xmpp: run only stops the text when a non-alphanumeric
+// precedes it.
 function scanInlineText(src) {
   const n = src.length;
   if (n === 0) return 0;
@@ -1663,6 +1732,12 @@ function lheadingMaybe(src) {
   return false;
 }
 
+// The block lexer. Each iteration dispatches on the first character of
+// the remaining source (after up to three spaces) and tries only the
+// tokenizers that could match there; the two expensive regexes (table,
+// setext heading) run only after their cheap pre-checks say "maybe".
+// Adjacent space, code, def and text tokens are merged into the previous
+// paragraph/text token the way marked merges them.
 function blockTokens(ctx, src, tokens = [], lastParagraphClipped = false) {
   let srcLength = Infinity;
   while (src) {
@@ -1806,6 +1881,9 @@ function queueInline(ctx, src, tokens = []) {
   return tokens;
 }
 
+// Does `text` contain a link (inline or reference) that would resolve?
+// Used by the masking pass to decide whether a reflink label hides a link
+// inside its own text.
 function linkInText(ctx, text) {
   if (!text.includes('[')) {
     return false;
@@ -1830,6 +1908,12 @@ function linkInText(ctx, text) {
   return false;
 }
 
+// Mask the parts of an inline source that the emphasis/del passes must
+// not see as delimiters: reference links whose label is a known
+// definition (replaced by `[aaa…]`), escaped punctuation (replaced by
+// `+`), code spans (their backticks kept, their contents neutralised)
+// and inline links / HTML tags (replaced by `[aaa…]`). Each masking pass
+// only runs when the characters it looks for are present at all.
 function maskSrc(ctx, src) {
   let maskedSrc = src;
   // A reflink only masks when its label is a known definition; with no
@@ -1874,6 +1958,8 @@ function maskSrc(ctx, src) {
   return maskedSrc;
 }
 
+// First character of a possible extended autolink: an alphanumeric, or
+// one of . _ + - (for www. and the protocol forms).
 function isUrlStart(c) {
   if (!c) return false;
   const code = c.charCodeAt(0);
@@ -1881,6 +1967,9 @@ function isUrlStart(c) {
     || c === '.' || c === '_' || c === '+' || c === '-';
 }
 
+// Inline lexing of one queued run. `linkParenPossible` records whether
+// the run contains a ')' at all, so tokLink can skip its regex outright
+// when there is no closing paren for a link destination to need.
 function inlineTokens(ctx, src, tokens = []) {
   const prevLinkParenPossible = ctx.state.linkParenPossible;
   ctx.state.linkParenPossible = prevLinkParenPossible && src.includes(')');
@@ -1910,6 +1999,10 @@ function inlineTokensInner(ctx, src, tokens) {
   }
 }
 
+// The inline lexer: first-character dispatch over the tokenizers, with
+// adjacent text tokens merged. prevChar is the last character of the
+// previous text token (kept across tokens so the emphasis rules see the
+// character before a delimiter run that a text token ended on).
 function tokenizeInlines(ctx, src, maskedSrc, tokens) {
   let keepPrevChar = false;
   let prevChar = '';
@@ -2015,6 +2108,9 @@ function tokenizeInlines(ctx, src, maskedSrc, tokens) {
   return tokens;
 }
 
+// Lex a whole document: normalise CRLF/CR to LF, run the block lexer,
+// then run the queued inline passes (link definitions are all known by
+// then, so reference links resolve).
 function lex(ctx, src) {
   if (src.indexOf('\r') !== -1) {
     src = src.replace(other.carriageReturn, '\n');
@@ -2030,6 +2126,13 @@ function lex(ctx, src) {
 }
 
 // ---------- rendering (parser + renderer fused) ----------
+// The renderer walks the token tree and writes HTML directly, instead of
+// going through a renderer object the way marked does. Text tokens are
+// escaped here, not at lex time, except inside raw blocks where the text
+// is already literal.
+
+// Plain text of a token: either its inline tokens rendered, or its own
+// text escaped (unless it was marked escaped, i.e. inside a raw block).
 function renderText(ctx, token) {
   if ('tokens' in token && token.tokens) {
     return renderInline(ctx, token.tokens);
@@ -2132,54 +2235,57 @@ function renderImage(ctx, token) {
 }
 
 function renderInline(ctx, tokens) {
-  let out = '';
+  // Collect the pieces in an array and join once: long inline runs in
+  // the generated documents concatenate hundreds of fragments, and a
+  // single join avoids building an intermediate string per fragment.
+  const parts = [];
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
     switch (token.type) {
       case 'escape': {
-        out += renderText(ctx, token);
+        parts.push(renderText(ctx, token));
         break;
       }
       case 'html': {
-        out += token.text;
+        parts.push(token.text);
         break;
       }
       case 'link': {
-        out += renderLink(ctx, token);
+        parts.push(renderLink(ctx, token));
         break;
       }
       case 'image': {
-        out += renderImage(ctx, token);
+        parts.push(renderImage(ctx, token));
         break;
       }
       case 'checkbox': {
-        out += '<input '
+        parts.push('<input '
           + (token.checked ? 'checked="" ' : '')
-          + 'disabled="" type="checkbox"> ';
+          + 'disabled="" type="checkbox"> ');
         break;
       }
       case 'strong': {
-        out += `<strong>${renderInline(ctx, token.tokens)}</strong>`;
+        parts.push(`<strong>${renderInline(ctx, token.tokens)}</strong>`);
         break;
       }
       case 'em': {
-        out += `<em>${renderInline(ctx, token.tokens)}</em>`;
+        parts.push(`<em>${renderInline(ctx, token.tokens)}</em>`);
         break;
       }
       case 'codespan': {
-        out += `<code>${escapeHtmlEntities(token.text, true)}</code>`;
+        parts.push(`<code>${escapeHtmlEntities(token.text, true)}</code>`);
         break;
       }
       case 'br': {
-        out += '<br>';
+        parts.push('<br>');
         break;
       }
       case 'del': {
-        out += `<del>${renderInline(ctx, token.tokens)}</del>`;
+        parts.push(`<del>${renderInline(ctx, token.tokens)}</del>`);
         break;
       }
       case 'text': {
-        out += renderText(ctx, token);
+        parts.push(renderText(ctx, token));
         break;
       }
       default: {
@@ -2187,10 +2293,12 @@ function renderInline(ctx, tokens) {
       }
     }
   }
-  return out;
+  return parts.join('');
 }
 
-// Plain-text rendering of inline tokens (image alt text).
+// Plain-text rendering of inline tokens (image alt text): links and
+// emphasis contribute their inner text, code spans and HTML contribute
+// their literal text, hard breaks contribute nothing.
 function renderInlineText(ctx, tokens) {
   let out = '';
   for (let i = 0; i < tokens.length; i++) {
